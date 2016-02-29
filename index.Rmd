@@ -1,0 +1,198 @@
+---
+title: "Machine Learning Assignment Writeup"
+author: "Coursera Student"
+date: "February 28, 2016"
+output: html_document
+---
+
+## Project Instructions
+
+The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
+
+
+## Overview
+The goal of this project is to use motion data to 
+We will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants who were asked to perform barbell lifts correctly and incorrectly in 5 different ways which correspond to classes A through E. 
+
+More information on the data is available here: http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises 
+(see the section on the Weight Lifting Exercise Dataset).
+
+
+## Approach
+We will use machine learning to fit models to the data. We will define a training set and a testing set, fit 3 different types of models to the test data and cross-validate using the testing set to identify the model with the best predictive power. We will also create a stacked model that combines the three individual models to see if that accomplishes any better accuracy. Finally we will evaluate the models and discuss their expected out of sample error. 
+
+#### Load required libraries
+
+We will rely mainly on the caret package for this analysis with some supporting packages.
+
+```{r libs,message=FALSE}
+  library(caret);library(rattle);library(randomForest);library(pgmm)
+```
+
+#### Download data and create test and partition sets
+Note that the "pml-testing.csv" file will be treated as the VALIDATION dataset. To allow proper cross-validation and tiered training of the stacked model, the data in "pml-training.csv" is divided into a training and testing set using a random 75/25 split.
+
+```{r getfiles, cache=TRUE,message=FALSE}
+  trainurl<-"http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  testurl<-"http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+  
+  trainfile<-"pml-training.csv"
+  testfile<-"pml-testing.csv"
+  
+  if(!file.exists(trainfile)){download.file(trainurl,destfile = trainfile)}
+  if(!file.exists(testfile)){download.file(testurl,destfile = testfile)}
+  
+  data<-read.csv(trainfile)
+  validation<-read.csv(testfile)
+  
+  set.seed(125)
+  inTrain<- createDataPartition(data$classe,p=.75,list=FALSE)
+  train<-data[inTrain,]
+  test<-data[-inTrain,]
+```
+
+
+### Data Cleaning
+The data is quite messy and has a lot of columns which are incomplete (or entirely NA's) in either the training data or the validation set.
+There is also some data which should not be considered in the model such as user name and timestamps - these would essentially allow the model to classify the motions using the order they were done in rather than the motion characteristics. This would be highly predictive for this dataset but not at all predictive for new samples.
+
+Below is some ugly code to remove these incomplete and irrelevant columns, and also fix some differences in how the two different CSV files were read into R.
+```{r cleaning, message=FALSE, cache=TRUE}
+  defactor<-function(data,classCol){
+    for(c in colnames(data)){
+      if(!(c %in% classCol)){
+        if (class(data[,c]) %in% c("factor","logical")){
+          data[,c]<-as.numeric(data[,c])
+        }
+      }
+    }
+    return(data)
+  }
+  
+  validation$classe<-as.factor("X")
+  validation<-validation[ ,!(names(validation) %in% "problem_id")]
+  
+    removeCols<- function(data){
+    # remove columns where more than half of the values are NA in the 
+    # test or validation sets
+    complete_cols1<-sapply(train,FUN = function(x)sum(is.na(x))<=.5*length(x))
+    complete_cols2<-sapply(validation,FUN = function(x)sum(is.na(x))<=.5*length(x))
+    complete_cols<- complete_cols1&complete_cols2
+    data<-data[,names(complete_cols[complete_cols==TRUE])]
+    col_remove<-c("user_name","raw_timestamp_part_1","X",
+                  "raw_timestamp_part_2","cvtd_timestamp","new_window","num_window")
+    data<-data[, !(colnames(data) %in% col_remove), drop=FALSE]
+    
+    data<-defactor(data ,"classe")
+    
+    return(data)
+    }
+  
+  train_clean<-removeCols(train)
+  validation_clean<-removeCols(validation)
+  validation_clean$magnet_dumbbell_z<-as.numeric(validation_clean$magnet_dumbbell_z)
+  validation_clean$magnet_forearm_y<-as.numeric(validation_clean$magnet_forearm_y)
+  validation_clean$magnet_forearm_z<-as.numeric(validation_clean$magnet_forearm_z)
+  validation_clean<-validation_clean[ ,!(names(validation_clean) %in% "classe")]
+  
+  # convert any factor variables other than classe to
+  # numeric
+
+  test_clean<-removeCols(test)
+  
+  set.seed(135)
+  
+  # create a random subsample (n=2000) of the training set for models
+  # that take to long to fit with the full dataset 
+  train_clean_sub<-train_clean[sample(1:length(train_clean$classe),size = 2000,replace = FALSE),]
+```
+
+
+## Model Building
+
+We will fit 3 machine learning models that have been identified as appropriate for predicting multi-level factors: Linear Discriminate Analysis, a Boosted Tree Model and a Random Forest model.
+We will use the train() function in the Caret package to fit these models.
+
+Note that the boosted tree model and the Random Forest model are computationally intensive and it was necessary to fit the model to a randomly selected subsample (n = 2000, see code in the Data Cleaning section) to make it feasible to complete the calculations in time.
+
+To estimate the models' *out of sample error*, we generate predictions from the models using the test set, and calculate the accuracy (proportion of right guesses) of those predictions. The estimated out-of-sample error rate is just 1 - Accuracy so moving forward we will just refer to Accuracy with that understanding.
+
+For each model we also generate predictions for the Validation set, which can be used to answer the Assignment Quiz and will also be used to create our stacked model.
+
+#### 1. Linear Discriminate Analysis (LDA)
+
+```{r lda, cache=TRUE,message=FALSE}
+# 1. train a Linear Discriminate Analysis (Bayesian / probablistic) model
+  set.seed(127)
+  lda.model<-train(classe~.,data=train_clean,method="lda")
+  lda.predict<-predict(lda.model,test_clean)
+  print(confusionMatrix(lda.predict,test$classe)$overall["Accuracy"])
+  lda.predict.val<- predict(lda.model,validation_clean)
+```
+
+#### 2. Boosted Tree Model
+
+```{r gbm,cache=TRUE,message=FALSE}
+ # train a gbm Boosting model ----
+ # (had to use an n = 1000 random subsample because the full training set was taking too long to compute)
+  set.seed(128)
+  gbm.model<-train(classe~.,data=train_clean_sub,method="gbm",preProcess="knnImpute",verbose=FALSE)
+  gbm.predict<-predict(gbm.model,test_clean)
+  gbm.predict.val<- predict(gbm.model,validation_clean)
+  print(confusionMatrix(gbm.predict,test$classe)$overall["Accuracy"])
+```
+
+#### 3. Random Forest Model
+
+```{r rf,cache=TRUE,message=FALSE}
+# train a random forest model ----
+
+  rf.model <- train(classe~.,data=train_clean_sub,method="rf",preProcess="knnImpute")
+  rf.predict<-predict(rf.model,test_clean)
+  rf.predict.val<- predict(rf.model,validation_clean)
+  print(confusionMatrix(rf.predict,test$classe)$overall["Accuracy"])
+```
+
+#### Discussion of individual models
+
+Of the 3 individual models, the Random Forest method proves to be most accurate (lowest estimated out-of-sample error) and the Linear Discriminate Analysis method the least. It may be that this data does not satisfy the assumption of probablistic relationships well enough to fit a Bayesian model.
+
+As it was the strongest individual model, we tested the Random Forest predictions on the Validation set in the assignment Quiz. This resulted in 16/20 correct answers, which is only an 80% accuracy (or 20% out-of-sample error) but this is quite a small sample. Next we will see if a stacked model performs better.
+
+### 4. Stacked Model
+
+To create a stacked model we combine the predictions made on the Test dataset into one dataframe along with the true values of classe.
+
+We fit a random forest model to predict the true values from each model's predicted values.
+
+The Variable Importance Plot shows the relative influence of each model on the final prediction.
+
+We can assess the in-sample accuracy of this model by testing the accuracy of the predictions against the Test values. We cannot assess the out-of-sample accuracy directly because we don't know the true Validation values but we do know it will be lower than the in-sample accuracy.
+
+We will also generate a final set of predictions for the Validation set, by using predictions on the Validation set from each model as inputs for the stacked model.
+
+```{r stacked, cache=TRUE,message=FALSE}
+  stack.frame<-data.frame(classe=test_clean$classe,
+                          rf=rf.predict,
+                          lda=lda.predict,
+                          gbm=gbm.predict)
+  stack.model<-train(classe~.,data=stack.frame,method="rf")
+  stack.predict<-predict(stack.model,newdata=stack.frame)
+  varImpPlot(stack.model$finalModel)
+  print(confusionMatrix(stack.predict,test$classe)$overall["Accuracy"])
+  stack.frame.val<-data.frame(rf=rf.predict.val,
+                              lda=lda.predict.val,
+                              gbm=gbm.predict.val)
+  stack.predict.val<-predict(stack.model,newdata=stack.frame.val)
+  names(stack.predict.val)<-1:20
+  print(stack.predict.val)
+```
+
+### Discussion of stacked model
+
+It is interesting to note that Random Forest, the model with the best predictive power individually, is also the most significant in the stacked model as shown in the Variable Importance Plot.
+
+We can see that the in-sample accuracy of the model is quite high, but we know that the out of sample accuracy will be lower than that.
+
+We tested the Validation predictions from the stacked model in the assignment Quiz. This achieved a result of 17/20 (85% accuracy), which is one better than the Random Forest model. This demonstrates that stacking models with variable predictive power can achieve results that are measurably better than the strongest model by itself.
+
